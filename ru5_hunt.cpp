@@ -376,8 +376,10 @@ int main(int argc, char** argv)
     if (LEN > 64) LEN = 64;
     if (argc > 4) LW_MIN = std::atoi(argv[4]);
     if (LW_MIN < 4) LW_MIN = 4;
+    int take_n = argc > 5 ? std::atoi(argv[5]) : 9000;
+    if (take_n < 100) take_n = 100;
 
-    if (!load_dict(dict, 9000)) {
+    if (!load_dict(dict, take_n)) {
         std::fprintf(stderr, "нет словаря\n");
         return 1;
     }
