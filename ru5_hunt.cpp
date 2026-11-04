@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 static constexpr const char* ALPH =
@@ -27,7 +28,8 @@ static constexpr int TAIL = 16;
 struct Entry { uint64_t code; int32_t wid; };
 struct Sel   { uint8_t i, j; int32_t wid; };
 struct Cand  {
-    uint8_t nw, cov, cross;
+    uint8_t nw, cov;
+    uint16_t cross;
     double score;
     char s[16 + 64];
     Sel sel[10];
@@ -179,6 +181,11 @@ static std::mutex g_mu;
 static Cand g_best;
 static bool g_hasbest = false;
 static int g_maxnw = 0;
+static std::mutex g_lwmu;
+static std::unordered_map<std::string, uint64_t> g_longwords;
+static std::atomic<uint64_t> g_longhits{0};
+static FILE* g_lwf = nullptr;
+static int LW_MIN = 6;
 
 struct RNG {
     uint64_t s;
@@ -216,6 +223,7 @@ static void worker(uint64_t seed)
         Sel hh[256];
         int nh = 0;
         for (int i = 0; i < TOT; ++i) {
+            if (buf[i] == '0') continue;
             uint64_t code = 0;
             int lim = TOT - i;
             if (lim > 16) lim = 16;
@@ -247,7 +255,7 @@ static void worker(uint64_t seed)
         Sel sel[10];
         int ns = 0, last = -1;
         for (int k = 0; k < nh && ns < 10; ++k)
-            if (hh[k].i > last) { sel[ns++] = hh[k]; last = hh[k].j; }
+            if (hh[k].i >= last) { sel[ns++] = hh[k]; last = hh[k].j; }
 
         if (ns < 2) {
             std::memmove(buf, buf + LEN, (size_t)TAIL);
@@ -272,14 +280,14 @@ static void worker(uint64_t seed)
 
         int nv = 0, nstop = 0;
         bool bad = false;
-        uint8_t cm = 0;
+        uint16_t cm = 0;
         for (int k = 0; k < ns; ++k) {
             uint8_t ct = wcat[(size_t)sel[k].wid];
             if (ct == 1) ++nv;
             else if (ct == 2) ++nstop;
             else if (ct == 3) bad = true;
             if (sel[k].i < TAIL && sel[k].j > TAIL)
-                cm |= (uint8_t)(1u << k);
+                cm |= (uint16_t)(1u << k);
         }
         if (bad || nv == 0 || nstop > 2) {
             g_gram.fetch_add(1, std::memory_order_relaxed);
@@ -291,6 +299,33 @@ static void worker(uint64_t seed)
                            std::memory_order_relaxed);
         if (cm)
             g_crossp.fetch_add(1, std::memory_order_relaxed);
+
+        for (int k = 0; k < ns; ++k) {
+            if (wcat[(size_t)sel[k].wid] == 3) continue;
+            const std::string& w = wordstr[(size_t)sel[k].wid];
+            int letters = (int)w.size() / 2;
+            if (letters < LW_MIN) continue;
+            g_longhits.fetch_add(1, std::memory_order_relaxed);
+            bool iscross = sel[k].i < TAIL && sel[k].j > TAIL;
+            std::lock_guard<std::mutex> lk(g_lwmu);
+            uint64_t& cnt = g_longwords[w];
+            if (cnt == 0 && g_lwf) {
+                char tsb[32];
+                std::time_t tt = std::time(nullptr);
+                std::strftime(tsb, sizeof tsb, "%Y-%m-%d %H:%M:%S",
+                              std::localtime(&tt));
+                std::fprintf(g_lwf, "%s | %d букв | %s | @%d-%d%s | фраза: ",
+                             tsb, letters, w.c_str(), (int)sel[k].i,
+                             (int)sel[k].j, iscross ? " СТЫК" : "");
+                for (int q = 0; q < ns; ++q) {
+                    if (q) std::fputc(' ', g_lwf);
+                    std::fputs(wordstr[(size_t)sel[q].wid].c_str(), g_lwf);
+                }
+                std::fputc('\n', g_lwf);
+                std::fflush(g_lwf);
+            }
+            cnt++;
+        }
 
         if (ns >= 4) {
             Cand c;
@@ -311,6 +346,7 @@ static void worker(uint64_t seed)
         }
         std::memmove(buf, buf + LEN, (size_t)TAIL);
     }
+    g_total.fetch_add(local & 0x3FFFULL, std::memory_order_relaxed);
 }
 
 static void fmt_cand(const Cand& c, std::string& digits, std::string& phrase,
@@ -338,6 +374,8 @@ int main(int argc, char** argv)
     if (argc > 3) LEN = std::atoi(argv[3]);
     if (LEN < 20) LEN = 20;
     if (LEN > 64) LEN = 64;
+    if (argc > 4) LW_MIN = std::atoi(argv[4]);
+    if (LW_MIN < 4) LW_MIN = 4;
 
     if (!load_dict(dict, 9000)) {
         std::fprintf(stderr, "нет словаря\n");
@@ -346,6 +384,7 @@ int main(int argc, char** argv)
 
     FILE* jf = std::fopen("hunt_journal.txt", "a");
     FILE* sf = std::fopen("hunt_stats.txt", "a");
+    g_lwf = std::fopen("hunt_longwords.txt", "a");
     if (!jf || !sf) {
         std::fprintf(stderr, "не могу открыть журналы\n");
         return 1;
@@ -431,6 +470,27 @@ int main(int argc, char** argv)
 
     const auto t1 = std::chrono::steady_clock::now();
     const double el = std::chrono::duration<double>(t1 - t0).count();
+    {
+        std::vector<std::pair<size_t, const std::string*>> v;
+        int maxlen = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_lwmu);
+            for (auto& kv : g_longwords) {
+                v.emplace_back((size_t)kv.second, &kv.first);
+                int L = (int)kv.first.size() / 2;
+                if (L > maxlen) maxlen = L;
+            }
+        }
+        std::sort(v.begin(), v.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::fprintf(sf, "=== ДЛИННЫЕ СЛОВА (>= %d букв): %zu уникальных, %llu попаданий, максимум %d букв; топ-30 ===\n",
+                     LW_MIN, g_longwords.size(),
+                     (unsigned long long)g_longhits.load(), maxlen);
+        for (size_t i = 0; i < v.size() && i < 30; ++i)
+            std::fprintf(sf, "%6zu | %s (%d букв)\n", v[i].first,
+                         v[i].second->c_str(), (int)v[i].second->size() / 2);
+        if (g_lwf) std::fflush(g_lwf);
+    }
     std::fprintf(sf, "=== ФИНАЛ %.0f сек | чисел %llu | %.1f млрд цифр | 2:%llu 3:%llu 4:%llu 5:%llu 6+:%llu | стык:%llu | макс слов %d ===\n",
                  el, (unsigned long long)g_total.load(),
                  (double)g_total.load() * LEN / 1e9,
@@ -441,6 +501,7 @@ int main(int argc, char** argv)
                  (unsigned long long)g_n6.load(),
                  (unsigned long long)g_crossw.load(), g_maxnw);
     std::fflush(sf);
+    if (g_lwf) std::fclose(g_lwf);
     std::fclose(sf);
     std::fclose(jf);
     return 0;
