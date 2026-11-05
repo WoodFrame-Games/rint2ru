@@ -157,7 +157,8 @@ fn main() {
     p2b[..6].copy_from_slice(b"518214");
     let p2 = u64::from_le_bytes(p2b);
 
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+    let threads = std::env::var("THREADS").ok().and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2));
     println!("RUST: пара привет+друг, зазор <= {} | {} потока | {:.0} сек", gapmax, threads, runtime);
     let t0 = Instant::now();
     let seed = std::time::SystemTime::now()
