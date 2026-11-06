@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <sched.h>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -103,8 +105,13 @@ struct Ring {
     int idx;
 };
 
-static void worker(uint64_t seed)
+static void worker(uint64_t seed, int tid)
 {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(tid, &set);
+    sched_setaffinity(0, sizeof(set), &set);
+
     RNG rng{seed};
     __m256i st = _mm256_setr_epi32(
         (int)(uint32_t)rng.next(), (int)(uint32_t)rng.next(),
@@ -123,6 +130,11 @@ static void worker(uint64_t seed)
     const __m256i fives = _mm256_set1_epi8('5');
 
     for (;;) {
+        // Период xorshift32-вектора ~2^32 итераций (~6.4e10 цифр), поэтому
+        // пересейваем состояние каждые NEWD=7680 цифр: поток не повторяется.
+        st = _mm256_set_epi64x(
+            (long long)rng.next(), (long long)rng.next(),
+            (long long)rng.next(), (long long)rng.next());
         int k = 0;
         while (k < NEWD) {
             gen16(st, buf + 32 + k + 0);
@@ -239,7 +251,7 @@ int main(int argc, char** argv)
     const uint64_t seed0 = (uint64_t)t0.time_since_epoch().count();
     std::vector<std::thread> ts;
     for (int t = 0; t < threads; ++t)
-        ts.emplace_back([&, t] { worker(seed0 ^ (0x9E3779B97F4A7C15ULL * (uint64_t)(t + 1))); });
+        ts.emplace_back([&, t] { worker(seed0 ^ (0x9E3779B97F4A7C15ULL * (uint64_t)(t + 1)), t); });
 
     double nxt = 30.0;
     for (;;) {
